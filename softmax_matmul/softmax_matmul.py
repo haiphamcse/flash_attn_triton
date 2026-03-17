@@ -10,7 +10,7 @@ def softmax_mult(x, V, dim=-1):
 
 
 @triton.jit
-def fused_softmax_triton_kernel(
+def fused_softmax_kernel(
     x_ptr,
     V_ptr,
     output_ptr,
@@ -120,7 +120,7 @@ def fused_softmax(x, V, BLOCK_1=16, BLOCK_2=16):
     grid = (batch_size, triton.cdiv(d1, BLOCK_1))
 
     # Launch kernel
-    fused_softmax_triton_kernel[grid](
+    fused_softmax_kernel[grid](
         x,
         V,
         fused_softmax_output,

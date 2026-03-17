@@ -141,7 +141,7 @@ def main():
         try:
             r = run_benchmark_config_pytorch(d2_val)
             results.append(r)
-        except (RuntimeError, OutOfMemoryError) as e:
+        except RuntimeError as e:
             err_str = str(e).lower()
             if "out of memory" in err_str:
                 print(f"  OOM for d2={d2_val}")
@@ -182,7 +182,7 @@ def main():
                 r = run_benchmark_config_triton(d2_val, BLOCK)
                 if r is not None:
                     results.append(r)
-            except (RuntimeError, OutOfMemoryError, CompilationError, CompileTimeAssertionFailure, OutOfResources) as e:
+            except (RuntimeError, CompilationError, CompilationError, CompileTimeAssertionFailure, OutOfResources) as e:
                 err_str = str(e).lower()
                 if "out of memory" in err_str:
                     print(f"  OOM for d2={d2_val}, BLOCK={BLOCK}")
