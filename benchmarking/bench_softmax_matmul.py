@@ -1,7 +1,9 @@
 """
-Benchmark: Fused Softmax-Matmul (Section 1.5 / Part 1.B)
+Benchmark: Fused Softmax-Matmul (Part 1.B)
 
-Compares Triton fused_softmax vs PyTorch softmax_mult.
+Compares Triton fused_softmax vs PyTorch softmax_mult across
+varying sequence lengths (d2) and block sizes.
+
 Run: python -m benchmarking.bench_softmax_matmul
 """
 import os
@@ -10,7 +12,6 @@ import sys
 import pandas as pd
 import torch
 
-# Add project root so we can import softmax_matmul
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -18,19 +19,18 @@ if _PROJECT_ROOT not in sys.path:
 from softmax_matmul.softmax_matmul import fused_softmax, softmax_mult
 
 try:
-    from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
+    from triton.compiler.errors import CompileTimeAssertionFailure
 except ImportError:
-    CompilationError = Exception
-    CompileTimeAssertionFailure = Exception
+    CompileTimeAssertionFailure = type("CompileTimeAssertionFailure", (Exception,), {})
 
 try:
     from triton.runtime.errors import OutOfResources
 except ImportError:
     OutOfResources = type("OutOfResources", (Exception,), {})
 
-# -----------------------------------------------------------------------------
-# Config (from homework 1.5.1)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 device = "cuda"
 dtype = torch.float32
 batch_size = 16
@@ -43,78 +43,62 @@ block_sizes = [16, 32, 64]
 OUTPUT_CSV = os.path.join(_PROJECT_ROOT, "outputs", "softmax_matmul_benchmark.csv")
 
 
-def run_one_forward(fn, x, V, **kwargs):
-    """Run a single forward pass and return (elapsed_ms, peak_mib)."""
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    fn(x, V, **kwargs)
-    end.record()
-    torch.cuda.synchronize()
-
-    elapsed_ms = start.elapsed_time(end)
-    peak_bytes = torch.cuda.max_memory_allocated()
-    peak_mib = peak_bytes / (1024.0 * 1024.0)
-    return elapsed_ms, peak_mib
-
-
-def run_benchmark_config_triton(d2_val, BLOCK):
-    """Benchmark fused_softmax for one (d2, BLOCK). Returns dict or None on failure."""
-    if d1 % BLOCK != 0 or d2_val % BLOCK != 0:
-        return None
-    x = torch.randn(batch_size, d1, d2_val, device=device, dtype=dtype)
-    V = torch.randn(batch_size, d2_val, d3, device=device, dtype=dtype)
-
-    def fn():
-        return fused_softmax(x, V, BLOCK_1=BLOCK, BLOCK_2=BLOCK)
-
-    # Warmup
-    for _ in range(nb_warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    times = []
-    peaks = []
-    for _ in range(nb_passes):
-        t, m = run_one_forward(fused_softmax, x, V, BLOCK_1=BLOCK, BLOCK_2=BLOCK)
-        times.append(t)
-        peaks.append(m)
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _failed_row(d2_val, is_triton, block=pd.NA):
     return {
         "batch_size": batch_size,
         "d1": d1,
         "d2": d2_val,
         "d3": d3,
-        "triton": True,
-        "BLOCK": BLOCK,
-        "forward_ms_mean": float(torch.tensor(times).mean().item()),
-        "forward_ms_std": float(torch.tensor(times).std().item()) if len(times) > 1 else 0.0,
-        "forward_peak_MiB": float(max(peaks)),
+        "triton": is_triton,
+        "BLOCK": block,
+        "forward_ms_mean": None,
+        "forward_ms_std": None,
+        "forward_peak_MiB": None,
     }
 
 
-def run_benchmark_config_pytorch(d2_val):
-    """Benchmark softmax_mult for one d2. No BLOCK."""
+def _time_fn(fn, nb_iters):
+    """Return list of (elapsed_ms, peak_mib) for *nb_iters* calls."""
+    records = []
+    for _ in range(nb_iters):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = start.elapsed_time(end)
+        peak_mib = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        records.append((elapsed_ms, peak_mib))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runners
+# ---------------------------------------------------------------------------
+def bench_pytorch(d2_val):
     x = torch.randn(batch_size, d1, d2_val, device=device, dtype=dtype)
     V = torch.randn(batch_size, d2_val, d3, device=device, dtype=dtype)
 
-    def fn():
-        return softmax_mult(x, V)
+    fn = lambda: softmax_mult(x, V)
 
     for _ in range(nb_warmup):
         fn()
     torch.cuda.synchronize()
 
-    times = []
-    peaks = []
-    for _ in range(nb_passes):
-        t, m = run_one_forward(softmax_mult, x, V)
-        times.append(t)
-        peaks.append(m)
+    records = _time_fn(fn, nb_passes)
+    times = [r[0] for r in records]
+    peaks = [r[1] for r in records]
 
+    t = torch.tensor(times)
     return {
         "batch_size": batch_size,
         "d1": d1,
@@ -122,85 +106,92 @@ def run_benchmark_config_pytorch(d2_val):
         "d3": d3,
         "triton": False,
         "BLOCK": pd.NA,
-        "forward_ms_mean": float(torch.tensor(times).mean().item()),
-        "forward_ms_std": float(torch.tensor(times).std().item()) if len(times) > 1 else 0.0,
-        "forward_peak_MiB": float(max(peaks)),
+        "forward_ms_mean": t.mean().item(),
+        "forward_ms_std": t.std().item() if len(times) > 1 else 0.0,
+        "forward_peak_MiB": max(peaks),
     }
 
 
+def bench_triton(d2_val, BLOCK):
+    x = torch.randn(batch_size, d1, d2_val, device=device, dtype=dtype)
+    V = torch.randn(batch_size, d2_val, d3, device=device, dtype=dtype)
+
+    fn = lambda: fused_softmax(x, V, BLOCK_1=BLOCK, BLOCK_2=BLOCK)
+
+    for _ in range(nb_warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    records = _time_fn(fn, nb_passes)
+    times = [r[0] for r in records]
+    peaks = [r[1] for r in records]
+
+    t = torch.tensor(times)
+    return {
+        "batch_size": batch_size,
+        "d1": d1,
+        "d2": d2_val,
+        "d3": d3,
+        "triton": True,
+        "BLOCK": BLOCK,
+        "forward_ms_mean": t.mean().item(),
+        "forward_ms_std": t.std().item() if len(times) > 1 else 0.0,
+        "forward_peak_MiB": max(peaks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available. Skipping benchmark.")
+        print("CUDA not available – skipping benchmark.")
         return
 
     results = []
 
-    # PyTorch baseline (one row per d2)
-    print("Benchmarking PyTorch softmax_mult...")
+    # --- PyTorch baseline ---
+    print("=== PyTorch softmax_mult ===")
     for d2_val in d2_values:
+        print(f"  d2={d2_val} ...", end=" ", flush=True)
         try:
-            r = run_benchmark_config_pytorch(d2_val)
+            r = bench_pytorch(d2_val)
             results.append(r)
+            print(f"{r['forward_ms_mean']:.3f} ms")
         except RuntimeError as e:
-            err_str = str(e).lower()
-            if "out of memory" in err_str:
-                print(f"  OOM for d2={d2_val}")
+            if "out of memory" in str(e).lower():
+                print("OOM")
                 torch.cuda.empty_cache()
-                results.append({
-                    "batch_size": batch_size,
-                    "d1": d1,
-                    "d2": d2_val,
-                    "d3": d3,
-                    "triton": False,
-                    "BLOCK": pd.NA,
-                    "forward_ms_mean": None,
-                    "forward_ms_std": None,
-                    "forward_peak_MiB": None,
-                })
+                results.append(_failed_row(d2_val, is_triton=False))
             else:
                 raise
 
-    # Triton fused_softmax (per d2 and BLOCK)
-    print("Benchmarking Triton fused_softmax...")
+    # --- Triton fused_softmax ---
+    print("\n=== Triton fused_softmax ===")
     for d2_val in d2_values:
         for BLOCK in block_sizes:
-            if d1 % BLOCK != 0 or d2_val % BLOCK != 0:
-                print(f"  Skipping d2={d2_val}, BLOCK={BLOCK} (incompatible)")
-                results.append({
-                    "batch_size": batch_size,
-                    "d1": d1,
-                    "d2": d2_val,
-                    "d3": d3,
-                    "triton": True,
-                    "BLOCK": BLOCK,
-                    "forward_ms_mean": None,
-                    "forward_ms_std": None,
-                    "forward_peak_MiB": None,
-                })
-                continue
+            tag = f"d2={d2_val}, BLOCK={BLOCK}"
+            print(f"  {tag} ...", end=" ", flush=True)
+
             try:
-                r = run_benchmark_config_triton(d2_val, BLOCK)
-                if r is not None:
-                    results.append(r)
-            except (RuntimeError, CompilationError, CompilationError, CompileTimeAssertionFailure, OutOfResources) as e:
-                err_str = str(e).lower()
-                if "out of memory" in err_str:
-                    print(f"  OOM for d2={d2_val}, BLOCK={BLOCK}")
+                r = bench_triton(d2_val, BLOCK)
+                results.append(r)
+                print(f"{r['forward_ms_mean']:.3f} ms")
+
+            except CompileTimeAssertionFailure:
+                print("skipped (incompatible)")
+                results.append(_failed_row(d2_val, is_triton=True, block=BLOCK))
+
+            except (RuntimeError, OutOfResources) as e:
+                err = str(e).lower()
+                if "out of memory" in err:
+                    print("OOM")
                     torch.cuda.empty_cache()
                 else:
-                    print(f"  Error for d2={d2_val}, BLOCK={BLOCK}: {e}")
-                results.append({
-                    "batch_size": batch_size,
-                    "d1": d1,
-                    "d2": d2_val,
-                    "d3": d3,
-                    "triton": True,
-                    "BLOCK": BLOCK,
-                    "forward_ms_mean": None,
-                    "forward_ms_std": None,
-                    "forward_peak_MiB": None,
-                })
+                    print(f"error – {e}")
+                results.append(_failed_row(d2_val, is_triton=True, block=BLOCK))
 
+    # --- Collect & save ---
     df = pd.DataFrame(results)
     df["BLOCK"] = df["BLOCK"].astype("Int64")
 

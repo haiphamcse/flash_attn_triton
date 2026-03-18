@@ -37,32 +37,35 @@ def fused_softmax_kernel(
 
     x_block = tl.make_block_ptr(
         # your code here
-        x_ptr + pid_batch * stride_xbatch,
-        shape=(d1,d2),
+        base=x_ptr + pid_batch * stride_xbatch,
+        shape=(d1, d2),
         strides=(stride_xrow, stride_xcol),
-        offsets=(pid_row*BLOCK_1, 0),
+        offsets=(pid_row * BLOCK_1, 0),
         block_shape=(BLOCK_1, BLOCK_2),
-        order=(1,0),
+        order=(1, 0),
     )
-
+    
     V_block = tl.make_block_ptr(
         # your code here
-        V_ptr + pid_batch * stride_Vbatch,
+        base=V_ptr + pid_batch * stride_Vbatch,
         shape=(d2,d3),
+        offsets=(0,0),
         strides=(stride_Vrow, stride_Vcol),
-        offsets=(0, 0),
         block_shape=(BLOCK_2, d3),
-        order=(0,1)
+        order=(1, 0),
+
+
     )
 
     output_block = tl.make_block_ptr(
         # your code here
-        output_ptr + pid_batch * stride_outbatch,
+        base=output_ptr + pid_batch * stride_outbatch,
         shape=(d1,d3),
-        strides=(stride_outrow, stride_outcol),
         offsets=(pid_row * BLOCK_1, 0),
+        strides=(stride_outrow, stride_outcol),
         block_shape=(BLOCK_1, d3),
-        order=(1,0),
+        order=(1, 0),
+
     )
 
     Num_blocks = tl.cdiv(d2, BLOCK_2)
@@ -72,20 +75,31 @@ def fused_softmax_kernel(
     out_prev = tl.zeros((BLOCK_1, d3), dtype=tl.float32)
 
     for _ in range(Num_blocks):
-        x = tl.load(x_block, boundary_check=(0,1), padding_option="zero")
-        v = tl.load(V_block, boundary_check=(1,0), padding_option="zero")
-
+        x = tl.load(x_block, boundary_check=(0,1), padding_option='zero') # your code here)
+        v = tl.load(V_block, boundary_check=(0,1), padding_option='zero')# your code here)
+        # x : [B1, B2], v : [B2, d3]
 
         # Compute block max (Hint: use tl.max and tl.maximum)
         # your code here
         block_max = tl.max(x, axis=1) # [B1,]
-        m_curr = tl.maximum(m_prev, block_max) # [B1,]
-
+        m_curr = tl.maximum(m_prev, block_max) #[B1,]
 
         # Update running sum with rescaling (Hint: use tl.exp and tl.sum)
-        exp_x_block = tl.exp(x - m_curr[:, None]) # [B1, B2]
-        exp_m = tl.exp(m_prev - m_curr) # [B1]
-        l_curr = l_prev * exp_m + tl.sum(exp_x_block, axis=1) # [B1]
+        # your code here
+        m_exp = tl.exp(m_prev - m_curr) #[B1,]
+        x_exp = tl.exp(x - m_curr[:, None]) #[B1, B2]
+        
+        l_curr = l_prev * m_exp #[B1,]
+        l_curr = l_curr + tl.sum(x_exp,axis=1) #[B1,]
+
+        o_left_term = m_exp * (l_prev / l_curr) #[B1,]
+        o_left_term = o_left_term[:, None] * out_prev #[B1, d3]
+
+        o_right_term = tl.dot((x_exp / l_curr[:, None]), v) #[B1, d3]
+
+        out_prev = o_left_term + o_right_term
+        m_prev = m_curr
+        l_prev = l_curr
 
 
         # Scale and accumulate 
@@ -93,20 +107,11 @@ def fused_softmax_kernel(
         # on Turing (T4, RTX8000), cast to tl.float16 for tl.dot product only because of this bug: https://github.com/triton-lang/triton/issues/5557
         # on Hopper (H100), no casting necessary
         # your code here
-        out_curr = exp_m[:, None] * (l_prev/l_curr)[:, None] * out_prev
-        
-        # Compute probabilities and multiply with values using tl.dot
-        p = exp_x_block / l_curr[:, None]
-        out_prev = out_curr + tl.dot(p.to(tl.float16), v.to(tl.float16)).to(tl.float32)
-
-        m_prev = m_curr
-        l_prev = l_curr
 
         x_block = x_block.advance((0, BLOCK_2))# your code here)
         V_block = V_block.advance((BLOCK_2, 0))# your code here)
 
     tl.store(output_block, out_prev, boundary_check=(0,1))# your code here)
-
 
 def fused_softmax(x, V, BLOCK_1=16, BLOCK_2=16):
     
