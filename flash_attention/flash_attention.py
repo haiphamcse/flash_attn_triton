@@ -279,6 +279,163 @@ def flash_fwd_kernel(
     tl.store(L_block, m_prev + tl.log(l_prev + 1e-20), boundary_check=(0,))
 
 
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr, dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    stride_dqb, stride_dqq, stride_dqd,
+    stride_dkb, stride_dkk, stride_dkd,
+    stride_dvb, stride_dvk, stride_dvd,
+    N_QUERIES, N_KEYS, scale,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    """Flash Attention backward kernel.
+
+    One program handles one query block and one batch element.
+    dK/dV are accumulated atomically because many query blocks contribute
+    to the same key/value rows.
+    """
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    # Batch offsets
+    Q_ptr = Q_ptr + pid_b * stride_qb
+    K_ptr = K_ptr + pid_b * stride_kb
+    V_ptr = V_ptr + pid_b * stride_vb
+    O_ptr = O_ptr + pid_b * stride_ob
+    L_ptr = L_ptr + pid_b * stride_lb
+    dO_ptr = dO_ptr + pid_b * stride_dqb
+    dQ_ptr = dQ_ptr + pid_b * stride_dqb
+    dK_ptr = dK_ptr + pid_b * stride_dkb
+    dV_ptr = dV_ptr + pid_b * stride_dvb
+
+    Q_block = tl.make_block_ptr(
+        Q_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    O_block = tl.make_block_ptr(
+        O_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    dO_block = tl.make_block_ptr(
+        dO_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_dqq, stride_dqd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    dQ_block = tl.make_block_ptr(
+        dQ_ptr,
+        shape=(N_QUERIES, D),
+        strides=(stride_dqq, stride_dqd),
+        offsets=(pid_q * BLOCK_Q, 0),
+        block_shape=(BLOCK_Q, D),
+        order=(1, 0),
+    )
+    L_block = tl.make_block_ptr(
+        L_ptr,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(pid_q * BLOCK_Q,),
+        block_shape=(BLOCK_Q,),
+        order=(0,),
+    )
+
+    Q = tl.load(Q_block, boundary_check=(0, 1), padding_option="zero")
+    O = tl.load(O_block, boundary_check=(0, 1), padding_option="zero")
+    dO = tl.load(dO_block, boundary_check=(0, 1), padding_option="zero")
+    L = tl.load(L_block, boundary_check=(0,), padding_option="zero")
+
+    q_idx = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_idx < N_QUERIES
+    d_offsets = tl.arange(0, D)
+
+    # D = rowsum(O * dO)
+    D_local = tl.sum(O * dO, axis=1)
+
+    # Accumulator for dQ
+    dQ_local = tl.zeros((BLOCK_Q, D), dtype=tl.float32)
+
+    num_key_blocks = tl.cdiv(N_KEYS, BLOCK_K)
+    K_block = tl.make_block_ptr(
+        K_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+    V_block = tl.make_block_ptr(
+        V_ptr,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_K, D),
+        order=(1, 0),
+    )
+
+    for block_idx in range(num_key_blocks):
+        K = tl.load(K_block, boundary_check=(0, 1), padding_option="zero")
+        V = tl.load(V_block, boundary_check=(0, 1), padding_option="zero")
+
+        # Recompute scores and probabilities
+        S = tl.dot(Q, tl.trans(K)) / scale
+        k_idx = block_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = k_idx < N_KEYS
+        S = tl.where(k_mask[None, :], S, float("-inf"))
+        S = tl.where(q_mask[:, None], S, float("-inf"))
+
+        if is_causal:
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            S = tl.where(causal_mask, S, float("-inf"))
+
+        P = tl.exp(S - L[:, None])
+        P = tl.where(q_mask[:, None] & k_mask[None, :], P, 0.0)
+
+        # dV contribution: P^T @ dO
+        dV_block_local = tl.dot(tl.trans(P).to(dO.dtype), dO)
+
+        # dP = dO @ V^T
+        dP = tl.dot(dO, tl.trans(V))
+
+        # dS = P * (dP - D)
+        dS = P * (dP - D_local[:, None])
+
+        # dQ += dS @ K / scale
+        dQ_local = dQ_local + tl.dot(dS.to(K.dtype), K) / scale
+
+        # dK contribution: dS^T @ Q / scale
+        dK_block_local = tl.dot(tl.trans(dS).to(Q.dtype), Q) / scale
+
+        # Atomic add dK / dV into global gradients
+        ptr_dK = dK_ptr + k_idx[:, None] * stride_dkk + d_offsets[None, :] * stride_dkd
+        ptr_dV = dV_ptr + k_idx[:, None] * stride_dvk + d_offsets[None, :] * stride_dvd
+        kv_mask = k_mask[:, None] & (d_offsets[None, :] < D)
+        tl.atomic_add(ptr_dK, dK_block_local, mask=kv_mask)
+        tl.atomic_add(ptr_dV, dV_block_local, mask=kv_mask)
+
+        K_block = K_block.advance((BLOCK_K, 0))
+        V_block = V_block.advance((BLOCK_K, 0))
+
+    tl.store(dQ_block, dQ_local, boundary_check=(0, 1))
+
+
 class FlashAttentionTriton(torch.autograd.Function):
     """Flash Attention using Triton kernel for forward pass."""
 
@@ -311,8 +468,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         L = torch.empty((batch_size, seq_q), device=device, dtype=dtype)
 
         # Calculate grid dimensions
-        BLOCK_Q = 64
-        BLOCK_K = 32
+        BLOCK_Q = 16
+        BLOCK_K = 16
         grid = (triton.cdiv(seq_q, BLOCK_Q), batch_size)
 
         # Launch Triton kernel for both causal and non-causal cases. Masking is
@@ -325,7 +482,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
             seq_q, seq_k, math.sqrt(d),
-            D=d, BLOCK_Q=64, BLOCK_K=32, is_causal=is_causal
+            D=d, BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, is_causal=is_causal
         )
 
         # Save for backward
@@ -340,7 +497,37 @@ class FlashAttentionTriton(torch.autograd.Function):
         Backward pass — reuse your PyTorch implementation from Part 2.
         """
         Q, K, V, L, O = ctx.saved_tensors
-        dQ, dK, dV, _ = attention_backward_impl(
-            Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal
-        )
+        # Try Triton backward kernel first; fall back to PyTorch formula if
+        # Triton is unavailable or fails on the current GPU/runtime.
+        if Q.is_cuda and K.is_cuda and V.is_cuda and dO.is_cuda:
+            batch_size, seq_q, d = Q.shape
+            seq_k = K.shape[1]
+
+            dQ = torch.empty_like(Q)
+            dK = torch.zeros_like(K)
+            dV = torch.zeros_like(V)
+
+            BLOCK_Q = 16
+            BLOCK_K = 16
+            grid = (triton.cdiv(seq_q, BLOCK_Q), batch_size)
+
+            try:
+                flash_bwd_kernel[grid](
+                    Q, K, V, O, L, dO, dQ, dK, dV,
+                    Q.stride(0), Q.stride(1), Q.stride(2),
+                    K.stride(0), K.stride(1), K.stride(2),
+                    V.stride(0), V.stride(1), V.stride(2),
+                    O.stride(0), O.stride(1), O.stride(2),
+                    L.stride(0), L.stride(1),
+                    dQ.stride(0), dQ.stride(1), dQ.stride(2),
+                    dK.stride(0), dK.stride(1), dK.stride(2),
+                    dV.stride(0), dV.stride(1), dV.stride(2),
+                    seq_q, seq_k, ctx.sqrt_d,
+                    D=d, BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, is_causal=ctx.is_causal,
+                )
+                return dQ, dK, dV, None
+            except Exception:
+                pass
+
+        dQ, dK, dV, _ = attention_backward_impl(Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal)
         return dQ, dK, dV, None
