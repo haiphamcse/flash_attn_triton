@@ -12,6 +12,7 @@ In this final part, you will port your Flash Attention implementation to **Trito
 ## Prerequisites
 
 This part assumes you have completed **Part 2: Flash Attention in PyTorch**. You should be familiar with:
+
 - The Flash Attention forward algorithm (online softmax over tiles)
 - The backward pass formulas ($dQ$, $dK$, $dV$)
 - Saving the log-sum-exp $L$ for the backward pass
@@ -36,6 +37,7 @@ benchmarking/
 ```
 
 Your `flash_attention.py` should contain:
+
 - `FlashAttentionPytorch`: Your implementation from Part 2
 - `FlashAttentionTriton`: The new Triton-based implementation (this part)
 
@@ -69,6 +71,7 @@ def flash_fwd_kernel(
 ```
 
 The kernel should:
+
 - Use `tl.program_id(0)` for query block index and `tl.program_id(1)` for batch index
 - Create block pointers for Q, K, V, O, and L
 - Implement the same online softmax loop as in Part 2, but using Triton primitives
@@ -124,6 +127,7 @@ class FlashAttentionTriton(torch.autograd.Function):
 ### From PyTorch to Triton
 
 Your Part 2 forward pass has this structure:
+
 ```python
 for i in range(num_query_blocks):      # Outer loop over query blocks
     for j in range(num_key_blocks):    # Inner loop over key/value blocks
@@ -131,6 +135,7 @@ for i in range(num_query_blocks):      # Outer loop over query blocks
 ```
 
 In Triton, the **outer loop becomes parallelization**:
+
 - Each program instance handles one query block (and one batch element)
 - Only the inner loop over key/value blocks remains as an explicit loop
 
@@ -174,30 +179,30 @@ def flash_fwd_kernel(
 
 # ...
 ```
+
 where `scale` is $\frac{1}{\sqrt{d}}
 $ 
 
 ### Causal Masking in Triton
 
-You can use [`tl.arange`](https://triton-lang.org/main/python-api/generated/triton.language.arange.html) and [`tl.where`](https://triton-lang.org/main/python-api/generated/triton.language.where.html).
-
+You can use `[tl.arange](https://triton-lang.org/main/python-api/generated/triton.language.arange.html)` and `[tl.where](https://triton-lang.org/main/python-api/generated/triton.language.where.html)`.
 
 ### Casting
 
 Triton requires matching dtypes for matrix multiplications. You need to use `float32` for accumulators for numerical stability, you need to cast tensors appropriately:
 
 1. **Before `tl.dot`**: Cast $P_j$ (the attention weights) to match $V_j$'s dtype:
-   ```python
+  ```python
    O_i = O_i * alpha[:, None] + tl.dot(P.to(V_j.dtype), V_j)
-   ```
-
+  ```
 2. **Before storing output**: Cast the final output back to the input dtype:
-   ```python
+  ```python
    O_i = O_i.to(Q_i.dtype)
    tl.store(O_block, O_i, ...)
-   ```
+  ```
 
 You can access dtypes using:
+
 - `tensor.dtype` for Triton tensors
 - `block_ptr.type.element_ty` for block pointers
 
@@ -224,6 +229,7 @@ pytest tests/test_flash_memory.py -v
 ```
 
 The tests check:
+
 - **Correctness**: Output matches reference implementation (forward and backward)
 - **Causal masking**: Proper application of the causal mask
 - **Output shape**: Correct tensor dimensions
@@ -245,22 +251,18 @@ Complete `benchmarking/bench_attention.py` to compare your Triton implementation
 Your benchmark should:
 
 1. **Compare both implementations**:
-   - `pytorch_sdpa`: `torch.nn.functional.scaled_dot_product_attention` (compiled)
-   - `flash_triton`: Your `FlashAttentionTriton` implementation (compiled)
-
+  - `pytorch_sdpa`: `torch.nn.functional.scaled_dot_product_attention` (compiled)
+  - `flash_triton`: Your `FlashAttentionTriton` implementation (compiled)
 2. **Vary the context length**: Test with increasing sequence lengths:
-   `[256, 1024, 4096, 8192, 16384]`
-
+  `[256, 1024, 4096, 8192, 16384]`
 3. **Measure performance**:
-   - Forward pass execution time
-   - Backward pass execution time
-   - Peak GPU memory usage
-   - Saved activations memory
-
+  - Forward pass execution time
+  - Backward pass execution time
+  - Peak GPU memory usage
+  - Saved activations memory
 4. **Use CUDA events for accurate timing**
-    and  **Include warmup iterations**
-
-6. **Report results**: Print a summary table and save to CSV
+  and  **Include warmup iterations**
+5. **Report results**: Print a summary table and save to CSV
 
 #### Required Parameters
 
@@ -280,18 +282,20 @@ context_lengths = [256, 1024, 4096, 8192, 16384]
 
 Save results to `outputs/csv/attention_benchmark.csv` with columns:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `implementation` | str | Implementation name (`pytorch_sdpa` or `flash_triton`) |
-| `d_model` | int | Model dimension |
-| `seq_len` | int | Sequence length |
-| `forward_ms` | float | Forward pass time in milliseconds |
-| `forward_peak_MiB` | float | Peak GPU memory during forward pass |
-| `backward_ms` | float (nullable) | Backward pass time in milliseconds |
-| `backward_peak_MiB` | float (nullable) | Peak GPU memory during backward pass |
-| `saved_activations_MiB` | float | Memory for saved activations |
-| `status` | str | `ok`, `OOM`, or `OOM(backward)` |
-| `gpu` | str | GPU name |
+
+| Column                  | Type             | Description                                            |
+| ----------------------- | ---------------- | ------------------------------------------------------ |
+| `implementation`        | str              | Implementation name (`pytorch_sdpa` or `flash_triton`) |
+| `d_model`               | int              | Model dimension                                        |
+| `seq_len`               | int              | Sequence length                                        |
+| `forward_ms`            | float            | Forward pass time in milliseconds                      |
+| `forward_peak_MiB`      | float            | Peak GPU memory during forward pass                    |
+| `backward_ms`           | float (nullable) | Backward pass time in milliseconds                     |
+| `backward_peak_MiB`     | float (nullable) | Peak GPU memory during backward pass                   |
+| `saved_activations_MiB` | float            | Memory for saved activations                           |
+| `status`                | str              | `ok`, `OOM`, or `OOM(backward)`                        |
+| `gpu`                   | str              | GPU name                                               |
+
 
 #### Running Your Benchmark
 
@@ -309,6 +313,7 @@ python -m benchmarking.bench_attention --impl pytorch_sdpa
 #### Expected Results
 
 Your Flash Attention implementation should:
+
 - Match or approach PyTorch SDPA performance (which uses FlashAttention internally on supported hardware)
 - Use **linear memory** for the forward pass (no N×N attention matrix)
 - Scale to longer sequences than naive attention
@@ -323,5 +328,5 @@ For bonus points, implement the backward pass in Triton as well. This requires w
 2. Computes gradients $dQ$, $dK$, $dV$ using the formulas from Part 2
 3. Uses atomic operations or careful accumulation for $dK$ and $dV$ (since multiple query blocks contribute to the same key/value gradients)
 
-
 ---
+
